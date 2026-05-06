@@ -39,7 +39,6 @@ YAW_THRESHOLD = 30.0            # max horizontal head turn before "distracted"
 PITCH_THRESHOLD = 15.0          # max vertical head tilt before "distracted"
 
 # Pinch detection (thumb + index)
-PINCH_DISTANCE_THRESHOLD = 50   # max pixel distance between thumb & index tips
 PINCH_COOLDOWN = 1.5            # seconds between toggle events
 COLOR_HAND = (255, 180, 0)      # hand landmarks color
 
@@ -333,14 +332,25 @@ class GazeTracker:
     def cleanup(self):
         self._detector.close()
 
-
 class PinchDetector:
-    """Detects pinch gesture (thumb + index) using MediaPipe HandLandmarker."""
+    """Detects pinch gesture using scale-invariant 3D ratio (distance independent)."""
 
     MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
     MODEL_PATH = "hand_landmarker.task"
-    THUMB_TIP = 4
-    INDEX_TIP = 8
+    
+    # Repères MediaPipe utilisés
+    WRIST = 0          # Le poignet
+    INDEX_MCP = 5      # La base de l'index
+    THUMB_TIP = 4      # Le bout du pouce
+    INDEX_TIP = 8      # Le bout de l'index
+
+    # Seuil du Ratio de pincement (Distance doigts / Longueur paume)
+    # Un ratio inférieur à 0.15 signifie que les doigts se touchent presque.
+    PINCH_RATIO_THRESHOLD = 0.25 
+    
+    # Nombre d'images consécutives pour valider (Debouncing)
+    PINCH_CONFIRM_FRAMES = 5 
+    PINCH_COOLDOWN = 1.5
 
     def __init__(self):
         import mediapipe as mp
@@ -362,20 +372,13 @@ class PinchDetector:
             min_hand_presence_confidence=0.5,
         )
         self._detector = vision.HandLandmarker.create_from_options(options)
+        
         self._last_toggle_time = 0.0
-        self._prev_pinching = False
+        self._consecutive_pinch_frames = 0
+        
         print("[OK] MediaPipe HandLandmarker (pinch) loaded.")
 
     def detect(self, frame: np.ndarray) -> dict:
-        """
-        Detect a hand and check for pinch gesture (thumb + index touching).
-
-        Returns dict with:
-            - 'pinch_toggled': bool (True on the frame pinch is first detected)
-            - 'pinch_pts': tuple ((thumb_x,thumb_y), (index_x,index_y)) or None
-            - 'is_pinching': bool
-            - 'hand_landmarks': list of landmark lists for drawing
-        """
         h, w, _ = frame.shape
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
@@ -385,32 +388,54 @@ class PinchDetector:
                 "is_pinching": False, "hand_landmarks": []}
 
         if not result.hand_landmarks:
-            self._prev_pinching = False
+            self._consecutive_pinch_frames = 0  
             return info
 
-        # Store landmarks for drawing
+        # Affichage 2D classique
         for hand_lm in result.hand_landmarks:
             pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lm]
             info["hand_landmarks"].append(pts)
 
-        # Check pinch on the first detected hand
         hand_lm = result.hand_landmarks[0]
-        thumb = (int(hand_lm[self.THUMB_TIP].x * w), int(hand_lm[self.THUMB_TIP].y * h))
-        index = (int(hand_lm[self.INDEX_TIP].x * w), int(hand_lm[self.INDEX_TIP].y * h))
-        info["pinch_pts"] = (thumb, index)
+        
+        # Points pour dessiner le repère visuel
+        info["pinch_pts"] = (
+            (int(hand_lm[self.THUMB_TIP].x * w), int(hand_lm[self.THUMB_TIP].y * h)),
+            (int(hand_lm[self.INDEX_TIP].x * w), int(hand_lm[self.INDEX_TIP].y * h))
+        )
 
-        dist = np.sqrt((thumb[0] - index[0])**2 + (thumb[1] - index[1])**2)
-        is_pinching = dist < PINCH_DISTANCE_THRESHOLD
+        # ─── LOGIQUE D'INVARIANCE D'ÉCHELLE (RATIO 3D) ───
+        
+        # 1. Distance entre le bout du pouce et le bout de l'index
+        thumb = hand_lm[self.THUMB_TIP]
+        index = hand_lm[self.INDEX_TIP]
+        pinch_dist = np.sqrt((thumb.x - index.x)**2 + (thumb.y - index.y)**2 + (thumb.z - index.z)**2)
+        
+        # 2. Distance de référence : Taille de la paume (Poignet -> Base index)
+        wrist = hand_lm[self.WRIST]
+        index_mcp = hand_lm[self.INDEX_MCP]
+        palm_size = np.sqrt((wrist.x - index_mcp.x)**2 + (wrist.y - index_mcp.y)**2 + (wrist.z - index_mcp.z)**2)
+        
+        # 3. Calcul du ratio de pincement (sécurisé contre la division par zéro)
+        pinch_ratio = pinch_dist / (palm_size + 1e-6)
+        
+        # Si la distance entre les doigts fait moins de 15% de la taille de la main, c'est un pincement !
+        is_pinching = pinch_ratio < self.PINCH_RATIO_THRESHOLD
         info["is_pinching"] = is_pinching
 
+        # ─── LOGIQUE DE CONFIRMATION TEMPORELLE ───
+        if is_pinching:
+            self._consecutive_pinch_frames += 1
+        else:
+            self._consecutive_pinch_frames = 0
+
         now = time.time()
-        # Toggle on rising edge (fingers just came together)
-        if is_pinching and not self._prev_pinching:
-            if now - self._last_toggle_time > PINCH_COOLDOWN:
+        
+        if self._consecutive_pinch_frames == self.PINCH_CONFIRM_FRAMES:
+            if now - self._last_toggle_time > self.PINCH_COOLDOWN:
                 info["pinch_toggled"] = True
                 self._last_toggle_time = now
 
-        self._prev_pinching = is_pinching
         return info
 
     def cleanup(self):
@@ -571,9 +596,10 @@ class OverlayRenderer:
 class ProductivityEnforcer:
     """Main application controller with Frame Skipping optimization."""
 
-    def __init__(self, alarm_path: str, camera_id: int = 0):
+    def __init__(self, alarm_path: str, camera_id: int = 0, headless: bool = False):
         self._camera_id = camera_id
         self._cap = None
+        self._headless = headless   # Mode sans fenêtre (pour lancement depuis GUI/thread)
 
         # Flag de contrôle externe (pour le GUI)
         self.running = False
@@ -634,7 +660,7 @@ class ProductivityEnforcer:
             self._fps_timer = time.time()
 
     def _start_alarm(self, reason: str):
-        if not self._alarm_active:
+        if not self._alarm_active and self.running:
             print(f"\n🚨 ALARM TRIGGERED: {reason}")
             self._alarm_reason = reason
             self._alarm_active = True
@@ -764,10 +790,17 @@ class ProductivityEnforcer:
                 self._update_fps()
                 self._process_frame(frame)
 
-                cv2.imshow("Productivity Enforcer", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    self.running = False
-                    break
+                if self._headless:
+                    # Mode headless : pas de fenêtre, juste un petit délai
+                    # pour ne pas saturer le CPU
+                    import time as _t
+                    _t.sleep(0.01)
+                else:
+                    # Mode standalone : afficher la fenêtre OpenCV
+                    cv2.imshow("Productivity Enforcer", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        self.running = False
+                        break
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted by user.")
         finally:
@@ -777,7 +810,8 @@ class ProductivityEnforcer:
         print("[INFO] Cleaning up...")
         if self._cap:
             self._cap.release()
-        cv2.destroyAllWindows()
+        if not self._headless:
+            cv2.destroyAllWindows()
         self._alarm_player.cleanup()
         self._gaze_tracker.cleanup()
         self._pinch_detector.cleanup()
