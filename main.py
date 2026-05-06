@@ -569,11 +569,18 @@ class OverlayRenderer:
 
 
 class ProductivityEnforcer:
-    """Main application controller."""
+    """Main application controller with Frame Skipping optimization."""
 
     def __init__(self, alarm_path: str, camera_id: int = 0):
         self._camera_id = camera_id
         self._cap = None
+
+        # Flag de contrôle externe (pour le GUI)
+        self.running = False
+
+        # Durées configurables (modifiables par le GUI avant run())
+        self.phone_trigger_duration = PHONE_TRIGGER_DURATION
+        self.attention_trigger_duration = ATTENTION_TRIGGER_DURATION
 
         # Sub-modules
         self._phone_detector = PhoneDetector()
@@ -587,17 +594,27 @@ class ProductivityEnforcer:
         self._phone_start: float | None = None
         self._attention_start: float | None = None
 
-        # Alarm state (no more cooldown — alarm loops until resolved)
+        # Alarm state
         self._alarm_active = False
         self._alarm_reason = ""
 
         # Monitoring enabled state (toggled by pinch)
         self._monitoring_enabled = True
 
-        # FPS tracking
+        # FPS & Frame Skipping tracking
         self._fps = 0.0
-        self._frame_count = 0
+        self._frame_count = 0        # Compteur global pour les FPS
         self._fps_timer = time.time()
+        self._skip_counter = 0       # Compteur pour le Frame Skipping
+
+        # Cache pour mémoriser les dernières détections entre les frames analysées
+        self._last_pinch_info = {"pinch_toggled": False, "pinch_pts": None, "is_pinching": False, "hand_landmarks": []}
+        self._last_phone_detections = []
+        self._last_gaze_info = {
+            "face_detected": False, "looking_at_screen": False,
+            "yaw": 0.0, "pitch": 0.0, "iris_pts": None,
+            "nose_pt": None, "face_bbox": None,
+        }
 
     def _open_camera(self):
         self._cap = cv2.VideoCapture(self._camera_id)
@@ -617,7 +634,6 @@ class ProductivityEnforcer:
             self._fps_timer = time.time()
 
     def _start_alarm(self, reason: str):
-        """Start looping alarm."""
         if not self._alarm_active:
             print(f"\n🚨 ALARM TRIGGERED: {reason}")
             self._alarm_reason = reason
@@ -626,7 +642,6 @@ class ProductivityEnforcer:
             self._alarm_player.start_loop()
 
     def _stop_alarm(self):
-        """Stop alarm when condition is resolved."""
         if self._alarm_active:
             print("[OK] Condition resolved — alarm stopped.")
             self._alarm_active = False
@@ -637,15 +652,22 @@ class ProductivityEnforcer:
 
     def _process_frame(self, frame: np.ndarray) -> str:
         now = time.time()
+        self._skip_counter += 1
 
-        # ── Module 0: Pinch Detection (always active) ─────────────
-        pinch_info = self._pinch_detector.detect(frame)
-        self._renderer.draw_hands(frame, pinch_info)
+        # ── Module 0: Pinch Detection (1 image sur 2) ─────────────
+        if self._skip_counter % 2 == 0:
+            self._last_pinch_info = self._pinch_detector.detect(frame)
+        
+        # On utilise le cache pour l'affichage et la logique
+        self._renderer.draw_hands(frame, self._last_pinch_info)
 
-        if pinch_info["pinch_toggled"]:
+        if self._last_pinch_info["pinch_toggled"]:
             self._monitoring_enabled = not self._monitoring_enabled
             status = "ACTIVE" if self._monitoring_enabled else "PAUSED"
             print(f"\n🤏 PINCH DETECTED — Monitoring {status}")
+            # Reset du toggle pour éviter qu'il ne se déclenche en boucle sur les frames skippées
+            self._last_pinch_info["pinch_toggled"] = False 
+            
             if not self._monitoring_enabled:
                 self._stop_alarm()
                 self._phone_start = None
@@ -659,11 +681,13 @@ class ProductivityEnforcer:
             )
             return "PAUSED"
 
-        # ── Module 1: Phone Detection (YOLO) ──────────────────────
-        phone_detections = self._phone_detector.detect(frame)
-        self._renderer.draw_phone_boxes(frame, phone_detections)
+        # ── Module 1: Phone Detection YOLO (1 image sur 10) ───────
+        if self._skip_counter % 10 == 0:
+            self._last_phone_detections = self._phone_detector.detect(frame)
+            
+        self._renderer.draw_phone_boxes(frame, self._last_phone_detections)
 
-        if phone_detections:
+        if self._last_phone_detections:
             if self._phone_start is None:
                 self._phone_start = now
         else:
@@ -671,11 +695,13 @@ class ProductivityEnforcer:
 
         phone_elapsed = (now - self._phone_start) if self._phone_start else 0.0
 
-        # ── Module 2: Gaze Tracking (MediaPipe Iris) ──────────────
-        gaze = self._gaze_tracker.analyze(frame)
-        self._renderer.draw_gaze_info(frame, gaze)
+        # ── Module 2: Gaze Tracking (1 image sur 5) ───────────────
+        if self._skip_counter % 5 == 0:
+            self._last_gaze_info = self._gaze_tracker.analyze(frame)
+            
+        self._renderer.draw_gaze_info(frame, self._last_gaze_info)
 
-        is_attentive = gaze["face_detected"] and gaze["looking_at_screen"]
+        is_attentive = self._last_gaze_info["face_detected"] and self._last_gaze_info["looking_at_screen"]
 
         if is_attentive:
             self._attention_start = None
@@ -686,8 +712,8 @@ class ProductivityEnforcer:
         attention_elapsed = (now - self._attention_start) if self._attention_start else 0.0
 
         # ── Alarm logic: start/stop based on conditions ───────────
-        phone_triggered = phone_elapsed >= PHONE_TRIGGER_DURATION
-        attention_triggered = attention_elapsed >= ATTENTION_TRIGGER_DURATION
+        phone_triggered = phone_elapsed >= self.phone_trigger_duration
+        attention_triggered = attention_elapsed >= self.attention_trigger_duration
 
         if phone_triggered:
             self._start_alarm(f"Phone detected for {phone_elapsed:.1f}s")
@@ -707,6 +733,10 @@ class ProductivityEnforcer:
         if self._alarm_active:
             self._renderer.draw_alarm_flash(frame)
 
+        # Empêcher le compteur d'exploser vers l'infini
+        if self._skip_counter >= 1000:
+            self._skip_counter = 0
+
         return state
 
     def run(self):
@@ -714,6 +744,7 @@ class ProductivityEnforcer:
 
         print("\n" + "=" * 55)
         print("  🔥 EXTREME PRODUCTIVITY ENFORCER — ACTIVE 🔥")
+        print("  ⚙️  Optimisation Frame Skipping : ACTIVÉE")
         print(f"  Phone trigger:     {PHONE_TRIGGER_DURATION}s")
         print(f"  Attention trigger: {ATTENTION_TRIGGER_DURATION}s")
         print("  Alarm: LOOPS until condition resolved")
@@ -722,7 +753,8 @@ class ProductivityEnforcer:
         print("=" * 55 + "\n")
 
         try:
-            while True:
+            self.running = True
+            while self.running:
                 ret, frame = self._cap.read()
                 if not ret:
                     print("[ERROR] Failed to read frame from camera.")
@@ -734,6 +766,7 @@ class ProductivityEnforcer:
 
                 cv2.imshow("Productivity Enforcer", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
+                    self.running = False
                     break
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted by user.")
@@ -749,7 +782,6 @@ class ProductivityEnforcer:
         self._gaze_tracker.cleanup()
         self._pinch_detector.cleanup()
         print("[OK] Shutdown complete.")
-
 
 def main():
     parser = argparse.ArgumentParser(
