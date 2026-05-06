@@ -30,18 +30,44 @@ import numpy as np
 
 PHONE_TRIGGER_DURATION = 3.0    # seconds of continuous phone detection
 ATTENTION_TRIGGER_DURATION = 20.0  # seconds of continuous inattention
-COOLDOWN_DURATION = 5.0         # pause after alarm trigger
 YOLO_CONFIDENCE = 0.45          # YOLO detection confidence threshold
 FACE_CONFIDENCE = 0.5           # MediaPipe face detection confidence
 CELL_PHONE_CLASS_ID = 67        # COCO class ID for "cell phone"
+
+# Head pose thresholds (degrees)
+YAW_THRESHOLD = 30.0            # max horizontal head turn before "distracted"
+PITCH_THRESHOLD = 15.0          # max vertical head tilt before "distracted"
 
 # Visual overlay colors (BGR)
 COLOR_SAFE = (0, 200, 100)
 COLOR_WARNING = (0, 180, 255)
 COLOR_DANGER = (0, 0, 255)
 COLOR_PHONE_BOX = (0, 100, 255)
-COLOR_FACE_DOT = (255, 200, 0)
+COLOR_IRIS = (0, 255, 0)
+COLOR_IRIS_BAD = (0, 0, 255)
 COLOR_BG_PANEL = (30, 30, 30)
+
+# Key face landmark indices for head pose (MediaPipe 478 landmarks)
+NOSE_TIP = 1
+CHIN = 152
+LEFT_EYE_CORNER = 33
+RIGHT_EYE_CORNER = 263
+LEFT_MOUTH = 61
+RIGHT_MOUTH = 291
+
+# Iris landmark indices
+LEFT_IRIS_CENTER = 468
+RIGHT_IRIS_CENTER = 473
+
+# 3D model points for a generic face (used by solvePnP)
+FACE_3D_MODEL = np.array([
+    [0.0, 0.0, 0.0],          # Nose tip
+    [0.0, -330.0, -65.0],     # Chin
+    [-225.0, 170.0, -135.0],  # Left eye corner
+    [225.0, 170.0, -135.0],   # Right eye corner
+    [-150.0, -150.0, -125.0], # Left mouth corner
+    [150.0, -150.0, -125.0],  # Right mouth corner
+], dtype=np.float64)
 
 
 class VolumeController:
@@ -75,6 +101,7 @@ class AlarmPlayer:
 
         self._sound = self._pygame.mixer.Sound(alarm_path)
         self._sound.set_volume(1.0)
+        self._playing = False
         print(f"[OK] Alarm loaded: {alarm_path}")
 
     def _generate_default_alarm(self, path: str) -> str:
@@ -84,7 +111,7 @@ class AlarmPlayer:
         import math
 
         sample_rate = 44100
-        duration = 3.0  # seconds
+        duration = 3.0
         wav_path = path.replace(".mp3", ".wav") if path.endswith(".mp3") else path + ".wav"
 
         samples = []
@@ -92,13 +119,11 @@ class AlarmPlayer:
 
         for i in range(num_samples):
             t = i / sample_rate
-            # Multi-frequency aggressive alarm
-            freq1 = 880 + 200 * math.sin(2 * math.pi * 3 * t)  # Siren sweep
-            freq2 = 1200 + 300 * math.sin(2 * math.pi * 5 * t)  # Higher siren
+            freq1 = 880 + 200 * math.sin(2 * math.pi * 3 * t)
+            freq2 = 1200 + 300 * math.sin(2 * math.pi * 5 * t)
             sample = 0.5 * math.sin(2 * math.pi * freq1 * t) + \
                      0.3 * math.sin(2 * math.pi * freq2 * t) + \
-                     0.2 * math.sin(2 * math.pi * 440 * t)  # Bass tone
-            # Pulsating envelope
+                     0.2 * math.sin(2 * math.pi * 440 * t)
             envelope = 0.5 + 0.5 * math.sin(2 * math.pi * 8 * t)
             sample *= envelope
             samples.append(int(sample * 32767 * 0.9))
@@ -112,16 +137,25 @@ class AlarmPlayer:
         print(f"[OK] Generated default alarm: {wav_path}")
         return wav_path
 
-    def play(self):
-        """Play the alarm sound."""
-        self._sound.play()
+    def start_loop(self):
+        """Start playing alarm in infinite loop."""
+        if not self._playing:
+            self._sound.play(loops=-1)
+            self._playing = True
 
     def stop(self):
         """Stop the alarm sound."""
-        self._sound.stop()
+        if self._playing:
+            self._sound.stop()
+            self._playing = False
+
+    @property
+    def is_playing(self) -> bool:
+        return self._playing
 
     def cleanup(self):
         """Clean up pygame mixer."""
+        self.stop()
         self._pygame.mixer.quit()
 
 
@@ -137,99 +171,161 @@ class PhoneDetector:
         print("[OK] YOLOv8 nano loaded.")
 
     def detect(self, frame: np.ndarray) -> list:
-        """
-        Run YOLO inference on a frame.
-
-        Returns:
-            List of bounding boxes [(x1, y1, x2, y2, confidence)] for detected phones.
-        """
         results = self._model(
             frame,
             conf=self._confidence,
             classes=[CELL_PHONE_CLASS_ID],
             verbose=False,
         )
-
         detections = []
         for result in results:
             for box in result.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 conf = float(box.conf[0])
                 detections.append((x1, y1, x2, y2, conf))
-
         return detections
 
 
-class AttentionTracker:
-    """Tracks user face presence and forward gaze using MediaPipe Tasks API."""
+class GazeTracker:
+    """Tracks head pose + iris using MediaPipe FaceLandmarker + solvePnP."""
 
-    MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
-    MODEL_PATH = "blaze_face_short_range.tflite"
+    MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+    MODEL_PATH = "face_landmarker.task"
 
     def __init__(self, confidence: float = FACE_CONFIDENCE):
         import mediapipe as mp
         from mediapipe.tasks.python import BaseOptions, vision
 
         self._mp = mp
-        self._vision = vision
 
         # Auto-download model if not present
         if not os.path.isfile(self.MODEL_PATH):
-            print(f"[...] Downloading MediaPipe face detection model...")
+            print("[...] Downloading MediaPipe FaceLandmarker model...")
             import urllib.request
             urllib.request.urlretrieve(self.MODEL_URL, self.MODEL_PATH)
             print(f"[OK] Model downloaded: {self.MODEL_PATH}")
 
-        base_options = BaseOptions(
-            model_asset_path=self.MODEL_PATH
-        )
-        options = vision.FaceDetectorOptions(
+        base_options = BaseOptions(model_asset_path=self.MODEL_PATH)
+        options = vision.FaceLandmarkerOptions(
             base_options=base_options,
-            min_detection_confidence=confidence,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
+            num_faces=1,
+            min_face_detection_confidence=confidence,
+            min_face_presence_confidence=confidence,
         )
-        self._detector = vision.FaceDetector.create_from_options(options)
-        print("[OK] MediaPipe Face Detection loaded.")
+        self._detector = vision.FaceLandmarker.create_from_options(options)
+        print("[OK] MediaPipe FaceLandmarker loaded.")
 
-    def detect_face(self, frame: np.ndarray) -> list:
-        """
-        Detect faces in a frame.
+    def _compute_head_pose(self, lm, h: int, w: int) -> tuple:
+        """Compute yaw and pitch angles using solvePnP."""
+        # 2D image points from face landmarks
+        face_2d = np.array([
+            [lm[NOSE_TIP].x * w, lm[NOSE_TIP].y * h],
+            [lm[CHIN].x * w, lm[CHIN].y * h],
+            [lm[LEFT_EYE_CORNER].x * w, lm[LEFT_EYE_CORNER].y * h],
+            [lm[RIGHT_EYE_CORNER].x * w, lm[RIGHT_EYE_CORNER].y * h],
+            [lm[LEFT_MOUTH].x * w, lm[LEFT_MOUTH].y * h],
+            [lm[RIGHT_MOUTH].x * w, lm[RIGHT_MOUTH].y * h],
+        ], dtype=np.float64)
 
-        Returns:
-            List of face landmarks [(nose_x, nose_y, bbox)] for detected faces.
-            bbox = (x, y, w, h) in pixel coordinates.
-        """
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = self._mp.Image(
-            image_format=self._mp.ImageFormat.SRGB, data=rgb_frame
+        # Camera matrix (approximate with frame dimensions)
+        focal_length = w
+        center = (w / 2, h / 2)
+        camera_matrix = np.array([
+            [focal_length, 0, center[0]],
+            [0, focal_length, center[1]],
+            [0, 0, 1],
+        ], dtype=np.float64)
+        dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+        success, rvec, tvec = cv2.solvePnP(
+            FACE_3D_MODEL, face_2d, camera_matrix, dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
         )
-        results = self._detector.detect(mp_image)
+        if not success:
+            return 0.0, 0.0
 
-        faces = []
+        # Convert rotation vector to rotation matrix, then to Euler angles
+        rmat, _ = cv2.Rodrigues(rvec)
+        angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
+
+        yaw = angles[1]    # horizontal turn (left/right)
+        pitch = angles[0]  # vertical tilt (up/down)
+
+        # Normalize angles: RQDecomp3x3 can wrap around ±180°
+        # e.g. pitch=-170 when facing forward → should be +10
+        if pitch > 90:
+            pitch = pitch - 180
+        elif pitch < -90:
+            pitch = pitch + 180
+        if yaw > 90:
+            yaw = yaw - 180
+        elif yaw < -90:
+            yaw = yaw + 180
+
+        return yaw, pitch
+
+    def analyze(self, frame: np.ndarray) -> dict:
+        """
+        Analyze head pose and iris position.
+
+        Returns dict with:
+            - 'face_detected': bool
+            - 'looking_at_screen': bool (based on head pose)
+            - 'yaw': float (degrees, - = left, + = right)
+            - 'pitch': float (degrees, - = down, + = up)
+            - 'iris_pts': dict with left_iris/right_iris pixel coords
+            - 'nose_pt': (x, y) nose tip pixel coords
+            - 'face_bbox': (x, y, w, h) or None
+        """
         h, w, _ = frame.shape
-        for detection in results.detections:
-            bbox = detection.bounding_box
-            bx = bbox.origin_x
-            by = bbox.origin_y
-            bw = bbox.width
-            bh = bbox.height
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+        result = self._detector.detect(mp_image)
 
-            # Estimate nose position as center of bounding box (approximation)
-            # The keypoints list contains: left_eye, right_eye, nose_tip, mouth, left_ear, right_ear
-            keypoints = detection.keypoints
-            if keypoints and len(keypoints) > 2:
-                nose_kp = keypoints[2]  # nose_tip
-                nx = int(nose_kp.x * w)
-                ny = int(nose_kp.y * h)
-            else:
-                nx = bx + bw // 2
-                ny = by + bh // 2
+        info = {
+            "face_detected": False,
+            "looking_at_screen": False,
+            "yaw": 0.0,
+            "pitch": 0.0,
+            "iris_pts": None,
+            "nose_pt": None,
+            "face_bbox": None,
+        }
 
-            faces.append((nx, ny, (bx, by, bw, bh)))
+        if not result.face_landmarks:
+            return info
 
-        return faces
+        lm = result.face_landmarks[0]
+        info["face_detected"] = True
+
+        # Head pose estimation
+        yaw, pitch = self._compute_head_pose(lm, h, w)
+        info["yaw"] = yaw
+        info["pitch"] = pitch
+
+        # Looking at screen if head is roughly facing forward
+        info["looking_at_screen"] = abs(yaw) < YAW_THRESHOLD and abs(pitch) < PITCH_THRESHOLD
+
+        # Nose tip for drawing
+        info["nose_pt"] = (int(lm[NOSE_TIP].x * w), int(lm[NOSE_TIP].y * h))
+
+        # Iris positions for visual feedback
+        if len(lm) > RIGHT_IRIS_CENTER:
+            info["iris_pts"] = {
+                "left": (int(lm[LEFT_IRIS_CENTER].x * w), int(lm[LEFT_IRIS_CENTER].y * h)),
+                "right": (int(lm[RIGHT_IRIS_CENTER].x * w), int(lm[RIGHT_IRIS_CENTER].y * h)),
+            }
+
+        # Compute face bbox from all landmarks
+        xs = [int(l.x * w) for l in lm]
+        ys = [int(l.y * h) for l in lm]
+        info["face_bbox"] = (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+
+        return info
 
     def cleanup(self):
-        """Release MediaPipe resources."""
         self._detector.close()
 
 
@@ -241,12 +337,9 @@ class OverlayRenderer:
 
     @staticmethod
     def draw_phone_boxes(frame: np.ndarray, detections: list):
-        """Draw bounding boxes around detected phones."""
         for (x1, y1, x2, y2, conf) in detections:
-            # Glowing box effect
             cv2.rectangle(frame, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), COLOR_DANGER, 3)
             cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_PHONE_BOX, 2)
-
             label = f"PHONE {conf:.0%}"
             (tw, th), _ = cv2.getTextSize(label, OverlayRenderer.FONT, 0.6, 1)
             cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 8, y1), COLOR_PHONE_BOX, -1)
@@ -254,75 +347,91 @@ class OverlayRenderer:
                         OverlayRenderer.FONT, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
     @staticmethod
-    def draw_face_points(frame: np.ndarray, faces: list):
-        """Draw face detection indicators."""
-        for (nx, ny, (bx, by, bw, bh)) in faces:
-            # Face bounding box
-            cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), COLOR_SAFE, 1)
-            # Nose point (gaze direction indicator)
-            cv2.circle(frame, (nx, ny), 6, COLOR_FACE_DOT, -1)
-            cv2.circle(frame, (nx, ny), 8, (255, 255, 255), 1)
+    def draw_gaze_info(frame: np.ndarray, gaze: dict):
+        """Draw head pose info, iris dots, and face bbox."""
+        if not gaze["face_detected"]:
+            # No face — show warning
+            cv2.putText(frame, "NO FACE DETECTED", (frame.shape[1] // 2 - 140, 50),
+                        OverlayRenderer.FONT_BOLD, 0.7, COLOR_DANGER, 2, cv2.LINE_AA)
+            return
+
+        looking = gaze["looking_at_screen"]
+        iris_color = COLOR_IRIS if looking else COLOR_IRIS_BAD
+
+        # Draw iris dots
+        if gaze["iris_pts"]:
+            for key in ("left", "right"):
+                pt = gaze["iris_pts"][key]
+                cv2.circle(frame, pt, 4, iris_color, -1)
+                cv2.circle(frame, pt, 6, (255, 255, 255), 1)
+
+        # Nose dot
+        if gaze["nose_pt"]:
+            cv2.circle(frame, gaze["nose_pt"], 3, (255, 200, 0), -1)
+
+        # Face bounding box
+        if gaze["face_bbox"]:
+            bx, by, bw, bh = gaze["face_bbox"]
+            box_color = COLOR_SAFE if looking else COLOR_WARNING
+            cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), box_color, 1)
+
+        # Head pose label
+        label = "FOCUSED" if looking else "DISTRACTED"
+        color = COLOR_SAFE if looking else COLOR_DANGER
+        yaw, pitch = gaze["yaw"], gaze["pitch"]
+        txt = f"{label} (yaw:{yaw:+.0f} pitch:{pitch:+.0f})"
+        if gaze["face_bbox"]:
+            bx, by, _, _ = gaze["face_bbox"]
+            cv2.putText(frame, txt, (bx, by - 8),
+                        OverlayRenderer.FONT, 0.45, color, 1, cv2.LINE_AA)
 
     @staticmethod
-    def draw_status_panel(
-        frame: np.ndarray,
-        phone_elapsed: float,
-        attention_elapsed: float,
-        state: str,
-        fps: float,
-    ):
-        """Draw a translucent HUD panel with timer and status information."""
+    def draw_status_panel(frame, phone_elapsed, attention_elapsed, state, fps, alarm_reason=""):
         h, w = frame.shape[:2]
-        panel_h = 120
+        panel_h = 140
         panel_w = 340
 
-        # Create translucent overlay
         overlay = frame.copy()
         cv2.rectangle(overlay, (10, 10), (10 + panel_w, 10 + panel_h), COLOR_BG_PANEL, -1)
         cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
-
-        # Border
         cv2.rectangle(frame, (10, 10), (10 + panel_w, 10 + panel_h), (80, 80, 80), 1)
 
-        # Title
         cv2.putText(frame, "PRODUCTIVITY ENFORCER", (20, 35),
                     OverlayRenderer.FONT_BOLD, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
         # Phone timer bar
         phone_ratio = min(phone_elapsed / PHONE_TRIGGER_DURATION, 1.0)
         phone_color = COLOR_DANGER if phone_ratio >= 1.0 else (
-            COLOR_WARNING if phone_ratio > 0.3 else COLOR_SAFE
-        )
+            COLOR_WARNING if phone_ratio > 0.3 else COLOR_SAFE)
         cv2.putText(frame, f"Phone: {phone_elapsed:.1f}s / {PHONE_TRIGGER_DURATION:.0f}s",
                     (20, 58), OverlayRenderer.FONT, 0.45, phone_color, 1, cv2.LINE_AA)
-        cv2.rectangle(frame, (20, 63), (20 + 300, 73), (60, 60, 60), -1)
+        cv2.rectangle(frame, (20, 63), (320, 73), (60, 60, 60), -1)
         cv2.rectangle(frame, (20, 63), (20 + int(300 * phone_ratio), 73), phone_color, -1)
 
         # Attention timer bar
         att_ratio = min(attention_elapsed / ATTENTION_TRIGGER_DURATION, 1.0)
         att_color = COLOR_DANGER if att_ratio >= 1.0 else (
-            COLOR_WARNING if att_ratio > 0.5 else COLOR_SAFE
-        )
-        cv2.putText(frame, f"Attention: {attention_elapsed:.1f}s / {ATTENTION_TRIGGER_DURATION:.0f}s",
+            COLOR_WARNING if att_ratio > 0.5 else COLOR_SAFE)
+        cv2.putText(frame, f"Gaze: {attention_elapsed:.1f}s / {ATTENTION_TRIGGER_DURATION:.0f}s",
                     (20, 92), OverlayRenderer.FONT, 0.45, att_color, 1, cv2.LINE_AA)
-        cv2.rectangle(frame, (20, 97), (20 + 300, 107), (60, 60, 60), -1)
+        cv2.rectangle(frame, (20, 97), (320, 107), (60, 60, 60), -1)
         cv2.rectangle(frame, (20, 97), (20 + int(300 * att_ratio), 107), att_color, -1)
 
         # State + FPS
-        state_color = COLOR_DANGER if state == "ALARM" else (
-            COLOR_WARNING if state == "COOLDOWN" else COLOR_SAFE
-        )
+        state_color = COLOR_DANGER if state == "ALARM" else COLOR_SAFE
         cv2.putText(frame, f"[{state}]", (20, 125),
                     OverlayRenderer.FONT_BOLD, 0.5, state_color, 1, cv2.LINE_AA)
         cv2.putText(frame, f"FPS: {fps:.0f}", (280, 125),
                     OverlayRenderer.FONT, 0.4, (150, 150, 150), 1, cv2.LINE_AA)
 
+        if alarm_reason:
+            cv2.putText(frame, alarm_reason, (20, 145),
+                        OverlayRenderer.FONT, 0.4, COLOR_DANGER, 1, cv2.LINE_AA)
+
     @staticmethod
     def draw_alarm_flash(frame: np.ndarray, intensity: float = 0.3):
-        """Flash the screen red during alarm."""
         red_overlay = np.full_like(frame, (0, 0, 255), dtype=np.uint8)
         cv2.addWeighted(red_overlay, intensity, frame, 1.0 - intensity, 0, frame)
-
         h, w = frame.shape[:2]
         text = "!!! ALARM !!!"
         (tw, th), _ = cv2.getTextSize(text, OverlayRenderer.FONT_BOLD, 2.0, 3)
@@ -333,12 +442,7 @@ class OverlayRenderer:
 
 
 class ProductivityEnforcer:
-    """
-    Main application controller.
-
-    Orchestrates the video capture, detection modules, timer logic,
-    and alarm system into a cohesive real-time monitoring loop.
-    """
+    """Main application controller."""
 
     def __init__(self, alarm_path: str, camera_id: int = 0):
         self._camera_id = camera_id
@@ -346,15 +450,18 @@ class ProductivityEnforcer:
 
         # Sub-modules
         self._phone_detector = PhoneDetector()
-        self._attention_tracker = AttentionTracker()
+        self._gaze_tracker = GazeTracker()
         self._alarm_player = AlarmPlayer(alarm_path)
         self._volume_ctrl = VolumeController()
         self._renderer = OverlayRenderer()
 
         # Timer state
-        self._phone_start: float | None = None  # When phone was first seen
-        self._attention_start: float | None = None  # When attention was first lost
-        self._cooldown_until: float = 0.0  # Cooldown end timestamp
+        self._phone_start: float | None = None
+        self._attention_start: float | None = None
+
+        # Alarm state (no more cooldown — alarm loops until resolved)
+        self._alarm_active = False
+        self._alarm_reason = ""
 
         # FPS tracking
         self._fps = 0.0
@@ -362,7 +469,6 @@ class ProductivityEnforcer:
         self._fps_timer = time.time()
 
     def _open_camera(self):
-        """Open the webcam capture."""
         self._cap = cv2.VideoCapture(self._camera_id)
         if not self._cap.isOpened():
             print(f"[ERROR] Cannot open camera {self._camera_id}")
@@ -372,7 +478,6 @@ class ProductivityEnforcer:
         print(f"[OK] Camera {self._camera_id} opened.")
 
     def _update_fps(self):
-        """Update FPS counter."""
         self._frame_count += 1
         elapsed = time.time() - self._fps_timer
         if elapsed >= 1.0:
@@ -380,36 +485,27 @@ class ProductivityEnforcer:
             self._frame_count = 0
             self._fps_timer = time.time()
 
-    def _trigger_alarm(self, reason: str):
-        """Execute the punishment sequence."""
-        print(f"\n🚨 ALARM TRIGGERED: {reason}")
-        self._volume_ctrl.set_max_volume()
-        self._alarm_player.play()
+    def _start_alarm(self, reason: str):
+        """Start looping alarm."""
+        if not self._alarm_active:
+            print(f"\n🚨 ALARM TRIGGERED: {reason}")
+            self._alarm_reason = reason
+            self._alarm_active = True
+            self._volume_ctrl.set_max_volume()
+            self._alarm_player.start_loop()
 
-        # Set cooldown
-        self._cooldown_until = time.time() + COOLDOWN_DURATION
-
-        # Reset timers
-        self._phone_start = None
-        self._attention_start = None
+    def _stop_alarm(self):
+        """Stop alarm when condition is resolved."""
+        if self._alarm_active:
+            print("[OK] Condition resolved — alarm stopped.")
+            self._alarm_active = False
+            self._alarm_reason = ""
+            self._alarm_player.stop()
+            self._phone_start = None
+            self._attention_start = None
 
     def _process_frame(self, frame: np.ndarray) -> str:
-        """
-        Process a single frame through both detection modules.
-
-        Returns the current application state: 'MONITORING', 'ALARM', or 'COOLDOWN'.
-        """
         now = time.time()
-
-        # During cooldown, skip detection
-        if now < self._cooldown_until:
-            remaining = self._cooldown_until - now
-            self._renderer.draw_status_panel(frame, 0.0, 0.0, "COOLDOWN", self._fps)
-            # Show cooldown countdown
-            cv2.putText(frame, f"Cooldown: {remaining:.1f}s",
-                        (frame.shape[1] // 2 - 100, frame.shape[0] - 30),
-                        OverlayRenderer.FONT, 0.7, COLOR_WARNING, 2, cv2.LINE_AA)
-            return "COOLDOWN"
 
         # ── Module 1: Phone Detection (YOLO) ──────────────────────
         phone_detections = self._phone_detector.detect(frame)
@@ -423,13 +519,13 @@ class ProductivityEnforcer:
 
         phone_elapsed = (now - self._phone_start) if self._phone_start else 0.0
 
-        # ── Module 2: Attention Tracking (MediaPipe) ──────────────
-        faces = self._attention_tracker.detect_face(frame)
-        self._renderer.draw_face_points(frame, faces)
+        # ── Module 2: Gaze Tracking (MediaPipe Iris) ──────────────
+        gaze = self._gaze_tracker.analyze(frame)
+        self._renderer.draw_gaze_info(frame, gaze)
 
-        face_detected = len(faces) > 0
+        is_attentive = gaze["face_detected"] and gaze["looking_at_screen"]
 
-        if face_detected:
+        if is_attentive:
             self._attention_start = None
         else:
             if self._attention_start is None:
@@ -437,33 +533,38 @@ class ProductivityEnforcer:
 
         attention_elapsed = (now - self._attention_start) if self._attention_start else 0.0
 
-        # ── Check trigger conditions ──────────────────────────────
-        state = "MONITORING"
+        # ── Alarm logic: start/stop based on conditions ───────────
+        phone_triggered = phone_elapsed >= PHONE_TRIGGER_DURATION
+        attention_triggered = attention_elapsed >= ATTENTION_TRIGGER_DURATION
 
-        if phone_elapsed >= PHONE_TRIGGER_DURATION:
-            self._trigger_alarm(f"Phone detected for {phone_elapsed:.1f}s")
-            state = "ALARM"
-        elif attention_elapsed >= ATTENTION_TRIGGER_DURATION:
-            self._trigger_alarm(f"Inattention for {attention_elapsed:.1f}s")
-            state = "ALARM"
+        if phone_triggered:
+            self._start_alarm(f"Phone detected for {phone_elapsed:.1f}s")
+        elif attention_triggered:
+            self._start_alarm(f"Inattention for {attention_elapsed:.1f}s")
+
+        # Stop alarm only when ALL conditions are resolved
+        if self._alarm_active and not phone_triggered and not attention_triggered:
+            self._stop_alarm()
+
+        state = "ALARM" if self._alarm_active else "MONITORING"
 
         # ── Draw HUD ──────────────────────────────────────────────
-        self._renderer.draw_status_panel(frame, phone_elapsed, attention_elapsed, state, self._fps)
-
-        if state == "ALARM":
+        self._renderer.draw_status_panel(
+            frame, phone_elapsed, attention_elapsed, state, self._fps, self._alarm_reason
+        )
+        if self._alarm_active:
             self._renderer.draw_alarm_flash(frame)
 
         return state
 
     def run(self):
-        """Main application loop."""
         self._open_camera()
 
         print("\n" + "=" * 55)
         print("  🔥 EXTREME PRODUCTIVITY ENFORCER — ACTIVE 🔥")
         print(f"  Phone trigger:     {PHONE_TRIGGER_DURATION}s")
-        print(f"  Attention trigger:  {ATTENTION_TRIGGER_DURATION}s")
-        print(f"  Cooldown:          {COOLDOWN_DURATION}s")
+        print(f"  Attention trigger: {ATTENTION_TRIGGER_DURATION}s")
+        print("  Alarm: LOOPS until condition resolved")
         print("  Press 'q' to quit.")
         print("=" * 55 + "\n")
 
@@ -474,31 +575,25 @@ class ProductivityEnforcer:
                     print("[ERROR] Failed to read frame from camera.")
                     break
 
-                # Mirror the frame for a natural experience
                 frame = cv2.flip(frame, 1)
-
                 self._update_fps()
                 self._process_frame(frame)
 
                 cv2.imshow("Productivity Enforcer", frame)
-
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
-
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted by user.")
         finally:
             self._cleanup()
 
     def _cleanup(self):
-        """Release all resources."""
         print("[INFO] Cleaning up...")
         if self._cap:
             self._cap.release()
         cv2.destroyAllWindows()
-        self._alarm_player.stop()
         self._alarm_player.cleanup()
-        self._attention_tracker.cleanup()
+        self._gaze_tracker.cleanup()
         print("[OK] Shutdown complete.")
 
 
@@ -507,18 +602,10 @@ def main():
         description="🔥 Extreme Productivity Enforcer — Webcam monitoring with alarm system.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--alarm",
-        type=str,
-        default="alarme.mp3",
-        help="Path to the alarm sound file (mp3 or wav). Default: alarme.mp3",
-    )
-    parser.add_argument(
-        "--camera",
-        type=int,
-        default=0,
-        help="Camera device ID. Default: 0",
-    )
+    parser.add_argument("--alarm", type=str, default="alarme.mp3",
+                        help="Path to the alarm sound file (mp3 or wav). Default: alarme.mp3")
+    parser.add_argument("--camera", type=int, default=0,
+                        help="Camera device ID. Default: 0")
     args = parser.parse_args()
 
     enforcer = ProductivityEnforcer(alarm_path=args.alarm, camera_id=args.camera)
