@@ -38,6 +38,11 @@ CELL_PHONE_CLASS_ID = 67        # COCO class ID for "cell phone"
 YAW_THRESHOLD = 30.0            # max horizontal head turn before "distracted"
 PITCH_THRESHOLD = 15.0          # max vertical head tilt before "distracted"
 
+# Pinch detection (thumb + index)
+PINCH_DISTANCE_THRESHOLD = 50   # max pixel distance between thumb & index tips
+PINCH_COOLDOWN = 1.5            # seconds between toggle events
+COLOR_HAND = (255, 180, 0)      # hand landmarks color
+
 # Visual overlay colors (BGR)
 COLOR_SAFE = (0, 200, 100)
 COLOR_WARNING = (0, 180, 255)
@@ -329,11 +334,133 @@ class GazeTracker:
         self._detector.close()
 
 
+class PinchDetector:
+    """Detects pinch gesture (thumb + index) using MediaPipe HandLandmarker."""
+
+    MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    MODEL_PATH = "hand_landmarker.task"
+    THUMB_TIP = 4
+    INDEX_TIP = 8
+
+    def __init__(self):
+        import mediapipe as mp
+        from mediapipe.tasks.python import BaseOptions, vision
+
+        self._mp = mp
+
+        if not os.path.isfile(self.MODEL_PATH):
+            print("[...] Downloading MediaPipe HandLandmarker model...")
+            import urllib.request
+            urllib.request.urlretrieve(self.MODEL_URL, self.MODEL_PATH)
+            print(f"[OK] Model downloaded: {self.MODEL_PATH}")
+
+        base_options = BaseOptions(model_asset_path=self.MODEL_PATH)
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=1,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.5,
+        )
+        self._detector = vision.HandLandmarker.create_from_options(options)
+        self._last_toggle_time = 0.0
+        self._prev_pinching = False
+        print("[OK] MediaPipe HandLandmarker (pinch) loaded.")
+
+    def detect(self, frame: np.ndarray) -> dict:
+        """
+        Detect a hand and check for pinch gesture (thumb + index touching).
+
+        Returns dict with:
+            - 'pinch_toggled': bool (True on the frame pinch is first detected)
+            - 'pinch_pts': tuple ((thumb_x,thumb_y), (index_x,index_y)) or None
+            - 'is_pinching': bool
+            - 'hand_landmarks': list of landmark lists for drawing
+        """
+        h, w, _ = frame.shape
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+        result = self._detector.detect(mp_image)
+
+        info = {"pinch_toggled": False, "pinch_pts": None,
+                "is_pinching": False, "hand_landmarks": []}
+
+        if not result.hand_landmarks:
+            self._prev_pinching = False
+            return info
+
+        # Store landmarks for drawing
+        for hand_lm in result.hand_landmarks:
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lm]
+            info["hand_landmarks"].append(pts)
+
+        # Check pinch on the first detected hand
+        hand_lm = result.hand_landmarks[0]
+        thumb = (int(hand_lm[self.THUMB_TIP].x * w), int(hand_lm[self.THUMB_TIP].y * h))
+        index = (int(hand_lm[self.INDEX_TIP].x * w), int(hand_lm[self.INDEX_TIP].y * h))
+        info["pinch_pts"] = (thumb, index)
+
+        dist = np.sqrt((thumb[0] - index[0])**2 + (thumb[1] - index[1])**2)
+        is_pinching = dist < PINCH_DISTANCE_THRESHOLD
+        info["is_pinching"] = is_pinching
+
+        now = time.time()
+        # Toggle on rising edge (fingers just came together)
+        if is_pinching and not self._prev_pinching:
+            if now - self._last_toggle_time > PINCH_COOLDOWN:
+                info["pinch_toggled"] = True
+                self._last_toggle_time = now
+
+        self._prev_pinching = is_pinching
+        return info
+
+    def cleanup(self):
+        self._detector.close()
+
+
 class OverlayRenderer:
     """Renders debug overlays on the video frame."""
 
     FONT = cv2.FONT_HERSHEY_SIMPLEX
     FONT_BOLD = cv2.FONT_HERSHEY_DUPLEX
+
+    @staticmethod
+    def draw_hands(frame: np.ndarray, pinch_info: dict):
+        """Draw hand landmarks and pinch indicator."""
+        for hand_pts in pinch_info.get("hand_landmarks", []):
+            # Draw connections between key landmarks
+            connections = [
+                (0, 1), (1, 2), (2, 3), (3, 4),    # thumb
+                (0, 5), (5, 6), (6, 7), (7, 8),    # index
+                (5, 9), (9, 10), (10, 11), (11, 12), # middle
+                (9, 13), (13, 14), (14, 15), (15, 16), # ring
+                (13, 17), (17, 18), (18, 19), (19, 20), # pinky
+                (0, 17),  # palm
+            ]
+            for i, j in connections:
+                if i < len(hand_pts) and j < len(hand_pts):
+                    cv2.line(frame, hand_pts[i], hand_pts[j], COLOR_HAND, 1, cv2.LINE_AA)
+            for pt in hand_pts:
+                cv2.circle(frame, pt, 2, (255, 255, 255), -1)
+
+        # Highlight thumb-index pinch points
+        if pinch_info.get("pinch_pts"):
+            thumb, index = pinch_info["pinch_pts"]
+            color = COLOR_SAFE if pinch_info["is_pinching"] else COLOR_HAND
+            cv2.circle(frame, thumb, 6, color, -1)
+            cv2.circle(frame, index, 6, color, -1)
+            cv2.line(frame, thumb, index, color, 2, cv2.LINE_AA)
+
+    @staticmethod
+    def draw_paused_overlay(frame: np.ndarray):
+        """Draw a PAUSED banner across the screen."""
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, h // 2 - 40), (w, h // 2 + 40), (50, 50, 50), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        text = "PAUSED  (pinch to resume)"
+        (tw, th), _ = cv2.getTextSize(text, OverlayRenderer.FONT_BOLD, 1.2, 2)
+        cv2.putText(frame, text, ((w - tw) // 2, h // 2 + th // 2),
+                    OverlayRenderer.FONT_BOLD, 1.2, (100, 200, 255), 2, cv2.LINE_AA)
 
     @staticmethod
     def draw_phone_boxes(frame: np.ndarray, detections: list):
@@ -451,6 +578,7 @@ class ProductivityEnforcer:
         # Sub-modules
         self._phone_detector = PhoneDetector()
         self._gaze_tracker = GazeTracker()
+        self._pinch_detector = PinchDetector()
         self._alarm_player = AlarmPlayer(alarm_path)
         self._volume_ctrl = VolumeController()
         self._renderer = OverlayRenderer()
@@ -462,6 +590,9 @@ class ProductivityEnforcer:
         # Alarm state (no more cooldown — alarm loops until resolved)
         self._alarm_active = False
         self._alarm_reason = ""
+
+        # Monitoring enabled state (toggled by pinch)
+        self._monitoring_enabled = True
 
         # FPS tracking
         self._fps = 0.0
@@ -506,6 +637,27 @@ class ProductivityEnforcer:
 
     def _process_frame(self, frame: np.ndarray) -> str:
         now = time.time()
+
+        # ── Module 0: Pinch Detection (always active) ─────────────
+        pinch_info = self._pinch_detector.detect(frame)
+        self._renderer.draw_hands(frame, pinch_info)
+
+        if pinch_info["pinch_toggled"]:
+            self._monitoring_enabled = not self._monitoring_enabled
+            status = "ACTIVE" if self._monitoring_enabled else "PAUSED"
+            print(f"\n🤏 PINCH DETECTED — Monitoring {status}")
+            if not self._monitoring_enabled:
+                self._stop_alarm()
+                self._phone_start = None
+                self._attention_start = None
+
+        # ── If paused, show overlay and skip detection ────────────
+        if not self._monitoring_enabled:
+            self._renderer.draw_paused_overlay(frame)
+            self._renderer.draw_status_panel(
+                frame, 0.0, 0.0, "PAUSED", self._fps, "Pinch to resume"
+            )
+            return "PAUSED"
 
         # ── Module 1: Phone Detection (YOLO) ──────────────────────
         phone_detections = self._phone_detector.detect(frame)
@@ -565,6 +717,7 @@ class ProductivityEnforcer:
         print(f"  Phone trigger:     {PHONE_TRIGGER_DURATION}s")
         print(f"  Attention trigger: {ATTENTION_TRIGGER_DURATION}s")
         print("  Alarm: LOOPS until condition resolved")
+        print("  🤏 Pinch (thumb+index) to PAUSE / RESUME")
         print("  Press 'q' to quit.")
         print("=" * 55 + "\n")
 
@@ -594,6 +747,7 @@ class ProductivityEnforcer:
         cv2.destroyAllWindows()
         self._alarm_player.cleanup()
         self._gaze_tracker.cleanup()
+        self._pinch_detector.cleanup()
         print("[OK] Shutdown complete.")
 
 
