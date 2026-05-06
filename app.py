@@ -17,8 +17,8 @@ import sys
 
 import customtkinter as ctk
 
-# Import du moteur de surveillance depuis main.py
-from main import ProductivityEnforcer
+# Import du moteur de surveillance depuis modules/
+from modules.enforcer import ProductivityEnforcer
 
 
 # ─────────────────────────────────────────────────────────────────
