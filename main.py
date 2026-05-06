@@ -822,8 +822,8 @@ def main():
         description="🔥 Extreme Productivity Enforcer — Webcam monitoring with alarm system.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--alarm", type=str, default="alarme.mp3",
-                        help="Path to the alarm sound file (mp3 or wav). Default: alarme.mp3")
+    parser.add_argument("--alarm", type=str, default="alarme.wav",
+                        help="Path to the alarm sound file (mp3 or wav). Default: alarme.wav")
     parser.add_argument("--camera", type=int, default=0,
                         help="Camera device ID. Default: 0")
     args = parser.parse_args()

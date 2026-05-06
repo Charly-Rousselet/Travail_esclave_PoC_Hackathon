@@ -234,7 +234,7 @@ class ProductivityApp(ctk.CTk):
         attention_dur = int(self._attention_slider.get())
 
         # Créer une nouvelle instance avec les réglages (headless = pas de fenêtre OpenCV)
-        self._enforcer = ProductivityEnforcer(alarm_path="alarme.mp3", camera_id=0, headless=True)
+        self._enforcer = ProductivityEnforcer(alarm_path="alarme.wav", camera_id=0, headless=True)
         self._enforcer.phone_trigger_duration = float(phone_dur)
         self._enforcer.attention_trigger_duration = float(attention_dur)
 
